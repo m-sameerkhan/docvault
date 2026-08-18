@@ -3,6 +3,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   getSupabaseServerClient,
+  getSupabaseSessionClient,
   EDGE_FUNCTION_URL,
 } from "@/lib/supabase/server";
 import {
@@ -20,7 +21,7 @@ export const dynamic = "force-dynamic";
  */
 export async function GET() {
   try {
-    const supabase = getSupabaseServerClient();
+    const supabase = getSupabaseSessionClient();
 
     const { data, error } = await supabase
       .from("files_metadata")

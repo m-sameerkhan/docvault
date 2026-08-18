@@ -1,8 +1,10 @@
 "use client";
 
 // Browser-side Supabase client.
-// Uses the PUBLIC anon key — fine to expose.
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+// Uses createBrowserClient from @supabase/ssr for automatic cookie-based
+// session handling. The PUBLIC anon key is fine to expose.
+import { createBrowserClient } from "@supabase/ssr";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 let client: SupabaseClient | null = null;
 
@@ -19,6 +21,6 @@ export function getSupabaseBrowserClient(): SupabaseClient {
     );
   }
 
-  client = createClient(url, anonKey);
+  client = createBrowserClient(url, anonKey);
   return client;
 }

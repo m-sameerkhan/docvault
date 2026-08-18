@@ -1,14 +1,12 @@
--- ============================================================
--- Supabase schema for the file manager
--- Run this in the Supabase SQL editor.
--- Requires: pgcrypto extension (enables gen_random_uuid()).
--- ============================================================
+
+-- Supabase Schema & Per-User RLS Policies for DocVault
+-- Run this complete script in the Supabase SQL Editor.
+
 
 create extension if not exists pgcrypto;
 
--- ------------------------------------------------------------
 -- Table: files_metadata
--- ------------------------------------------------------------
+
 create table if not exists public.files_metadata (
   id          uuid primary key default gen_random_uuid(),
   filename    text not null,
@@ -39,38 +37,50 @@ create trigger trg_files_metadata_updated_at
   for each row
   execute function public.set_updated_at();
 
--- ------------------------------------------------------------
--- Row Level Security
--- ------------------------------------------------------------
+
+-- Permissions (GRANTs)
+
+grant select, insert, update, delete on table public.files_metadata to authenticated;
+grant select, insert, update, delete on table public.files_metadata to service_role;
+
+
+-- Row Level Security (RLS) & Per-User Policies
+
 alter table public.files_metadata enable row level security;
 
--- PERMISSIVE policy for now.
--- WARNING: this lets anyone with the anon key read/write rows.
--- For production, replace the "true" with auth checks, e.g.:
---   using (auth.uid() = uploaded_by::uuid)
---   with check (auth.uid() = uploaded_by::uuid)
-create policy "permissive_all_access"
-  on public.files_metadata
-  for all
-  to anon, authenticated
-  using (true)
-  with check (true);
+-- Drop old development policy if it exists
+drop policy if exists "permissive_all_access" on public.files_metadata;
 
--- ------------------------------------------------------------
+-- Drop per-user policies if they already exist (prevents error 42710)
+drop policy if exists "users_select_own_files" on public.files_metadata;
+drop policy if exists "users_insert_own_files" on public.files_metadata;
+drop policy if exists "users_update_own_files" on public.files_metadata;
+drop policy if exists "users_delete_own_files" on public.files_metadata;
+
+-- Re-create per-user policies
+create policy "users_select_own_files"
+  on public.files_metadata for select
+  to authenticated
+  using (uploaded_by = auth.jwt() ->> 'email');
+
+create policy "users_insert_own_files"
+  on public.files_metadata for insert
+  to authenticated
+  with check (uploaded_by = auth.jwt() ->> 'email');
+
+create policy "users_update_own_files"
+  on public.files_metadata for update
+  to authenticated
+  using (uploaded_by = auth.jwt() ->> 'email');
+
+create policy "users_delete_own_files"
+  on public.files_metadata for delete
+  to authenticated
+  using (uploaded_by = auth.jwt() ->> 'email');
+
+
 -- Storage bucket: "documents" (private)
--- ------------------------------------------------------------
+
 insert into storage.buckets (id, name, public)
 values ('documents', 'documents', false)
 on conflict (id) do nothing;
-
--- Service role bypasses storage RLS, so no storage policy is needed
--- for the API routes / Edge Function (they use the service role key).
--- If you later authenticate end users directly, add storage policies:
---   create policy "documents_full_access" on storage.objects
---     for all using (bucket_id = 'documents') with check (bucket_id = 'documents');
-
--- ------------------------------------------------------------
--- Note: the validate-upload Edge Function uses the service role
--- key, so it bypasses RLS. The permissive policy above is a
--- development convenience; tighten it before production.
--- ------------------------------------------------------------

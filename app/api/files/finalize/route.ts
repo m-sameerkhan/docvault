@@ -3,6 +3,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   getSupabaseServerClient,
+  getSupabaseSessionClient,
   EDGE_FUNCTION_URL,
 } from "@/lib/supabase/server";
 import { DOCUMENTS_BUCKET } from "@/lib/files";
@@ -27,7 +28,6 @@ export async function POST(req: NextRequest) {
       filename?: string;
       fileSize?: number;
       fileType?: string;
-      uploadedBy?: string | null;
       notes?: string | null;
     };
 
@@ -43,6 +43,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Get the authenticated user's email for uploaded_by.
+    const sessionClient = getSupabaseSessionClient();
+    const { data: { user }, error: userError } = await sessionClient.auth.getUser();
+
+    if (userError || !user) {
+      return NextResponse.json(
+        { success: false, error: "Authentication required." },
+        { status: 401 },
+      );
+    }
+
     // --------------------------------------------------
     // Insert metadata row
     // --------------------------------------------------
@@ -54,7 +65,7 @@ export async function POST(req: NextRequest) {
         storage_path: storagePath,
         file_type: fileType,
         file_size: fileSize,
-        uploaded_by: body.uploadedBy?.trim() || null,
+        uploaded_by: user.email ?? null,
         notes: body.notes?.trim() || null,
         validated: false,
       });

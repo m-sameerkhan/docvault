@@ -97,7 +97,6 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
   const [progress, setProgress] = useState(0);
   const [activeFile, setActiveFile] = useState<{ name: string; size: number } | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
-  const [uploader, setUploader] = useState("");
   const [notes, setNotes] = useState("");
   const [showDetails, setShowDetails] = useState(false);
 
@@ -148,7 +147,6 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
             filename: displayName,
             fileSize: file.size,
             fileType,
-            uploadedBy: uploader.trim() || null,
             notes: notes.trim() || null,
           }),
         });
@@ -168,7 +166,7 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         if (inputRef.current) inputRef.current.value = "";
       }
     },
-    [uploader, notes, onUploaded, onError],
+    [notes, onUploaded, onError],
   );
 
   const onDrop = useCallback(
@@ -301,25 +299,10 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         )}
       </div>
 
-      {/* Uploader + notes — collapsed by default so it doesn't add height to the common case */}
+      {/* Notes — collapsed by default so it doesn't add height to the common case */}
       <div className="mt-2">
         {showDetails ? (
           <div className="flex flex-wrap items-end gap-2">
-            <div className="flex-1 basis-52">
-              <Label htmlFor="uploader" className="mb-1 block text-xs font-medium">
-                Uploader <span className="font-normal text-muted-foreground">(optional)</span>
-              </Label>
-              <Input
-                id="uploader"
-                type="text"
-                value={uploader}
-                onChange={(e) => setUploader(e.target.value)}
-                placeholder="e.g. team@acme.com"
-                autoComplete="email"
-                disabled={uploading}
-                className="h-8 w-full text-sm sm:w-64"
-              />
-            </div>
             <div className="flex-1 basis-52">
               <Label htmlFor="notes" className="mb-1 block text-xs font-medium">
                 Notes <span className="font-normal text-muted-foreground">(optional)</span>
@@ -334,7 +317,7 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
                 className="h-8 w-full text-sm sm:w-64"
               />
             </div>
-            {!uploader && !notes && (
+            {!notes && (
               <button
                 type="button"
                 onClick={() => setShowDetails(false)}
@@ -350,9 +333,9 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
             onClick={() => setShowDetails(true)}
             className="text-xs font-medium text-muted-foreground hover:text-primary"
           >
-            {uploader || notes
-              ? [uploader && `Uploader: ${uploader}`, notes && `Notes: ${notes}`].filter(Boolean).join(" · ")
-              : "+ Add uploader / notes (optional)"}
+            {notes
+              ? `Notes: ${notes}`
+              : "+ Add notes (optional)"}
           </button>
         )}
       </div>

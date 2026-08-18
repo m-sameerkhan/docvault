@@ -20,7 +20,6 @@ type Props = {
 
 export default function EditMetadataModal({ file, replaceMode, onClose, onSaved, onError }: Props) {
   const [filename, setFilename] = useState("");
-  const [uploadedBy, setUploadedBy] = useState("");
   const [notes, setNotes] = useState("");
   const [validated, setValidated] = useState(false);
   const [newFile, setNewFile] = useState<File | null>(null);
@@ -30,7 +29,6 @@ export default function EditMetadataModal({ file, replaceMode, onClose, onSaved,
   useEffect(() => {
     if (file) {
       setFilename(file.filename);
-      setUploadedBy(file.uploaded_by ?? "");
       setNotes(file.notes ?? "");
       setValidated(file.validated);
       setNewFile(null);
@@ -54,7 +52,6 @@ export default function EditMetadataModal({ file, replaceMode, onClose, onSaved,
     try {
       const formData = new FormData();
       formData.append("filename", filename.trim() || file.filename);
-      formData.append("uploaded_by", uploadedBy.trim());
       formData.append("notes", notes.trim());
       formData.append("validated", String(validated));
       if (newFile) formData.append("file", newFile);
@@ -101,11 +98,6 @@ export default function EditMetadataModal({ file, replaceMode, onClose, onSaved,
           <div>
             <Label htmlFor="modal-filename" className="mb-1 block">Filename</Label>
             <Input id="modal-filename" value={filename} onChange={(e) => setFilename(e.target.value)} />
-          </div>
-
-          <div>
-            <Label htmlFor="modal-uploader" className="mb-1 block">Uploaded by</Label>
-            <Input id="modal-uploader" value={uploadedBy} onChange={(e) => setUploadedBy(e.target.value)} />
           </div>
 
           <div>

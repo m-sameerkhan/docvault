@@ -5,6 +5,7 @@ import { FileStack, RefreshCw } from "lucide-react";
 import FileUploadForm from "@/components/FileUploadForm";
 import FileTable from "@/components/FileTable";
 import EditMetadataModal from "@/components/EditMetadataModal";
+import LogoutButton from "@/components/LogoutButton";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
@@ -111,10 +112,13 @@ export default function HomePage() {
           </div>
         </div>
 
-        <Button variant="outline" onClick={() => void refresh()}>
-          <RefreshCw className="h-4 w-4" />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={() => void refresh()}>
+            <RefreshCw className="h-4 w-4" />
+            Refresh
+          </Button>
+          <LogoutButton />
+        </div>
       </header>
 
       <div className="space-y-6">

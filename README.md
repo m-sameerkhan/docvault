@@ -29,7 +29,8 @@ terminal.
 | <img src="https://cdn.simpleicons.org/react/61DAFB" width="16"/> **React** | UI components and state |
 | <img src="https://cdn.simpleicons.org/typescript/3178C6" width="16"/> **TypeScript** | Type-safe development |
 | <img src="https://cdn.simpleicons.org/tailwindcss/38B2AC" width="16"/> **Tailwind CSS** | Responsive UI styling |
-| <img src="https://cdn.simpleicons.org/supabase/3ECF8E" width="16"/> **@supabase/supabase-js** | Supabase client (browser + server) |
+| <img src="https://cdn.simpleicons.org/supabase/3ECF8E" width="16"/> **@supabase/supabase-js** | Supabase client library |
+| <img src="https://cdn.simpleicons.org/supabase/3ECF8E" width="16"/> **@supabase/ssr** | SSR client with cookie-based auth session management |
 | <img src="https://cdn.simpleicons.org/supabase/3ECF8E" width="16"/> **Supabase Storage** | Private file storage |
 | <img src="https://cdn.simpleicons.org/postgresql/4169E1" width="16"/> **PostgreSQL** | File metadata database |
 | <img src="https://cdn.simpleicons.org/supabase/3ECF8E" width="16"/> **Supabase Edge Functions** | Server-side upload validation |
@@ -69,26 +70,22 @@ flowchart TD
 
 ### Security model
 
-The browser **never** receives the Supabase service-role/secret key.
+The browser **never** receives the Supabase service-role/secret key. All requests operate securely using Supabase Auth cookies and scoped client instances:
 
 ```mermaid
 flowchart LR
-    Browser -->|"fetch()"| Routes["Next.js API Routes"]
-    Routes -->|"service-role key"| Supabase
-    subgraph Supabase
-        S1[("Storage")]
-        S2[("PostgreSQL")]
-        S3["Edge Function"]
-    end
+    Browser["Browser (Auth Cookies)"] -->|"fetch() with Session Cookie"| Routes["Next.js API Routes / Middleware"]
+    
+    Routes -->|"Session-Aware Client (User JWT)"| DB[("PostgreSQL (RLS Enforced)")]
+    Routes -->|"Service-Role Client"| Storage[("Supabase Storage (Signed URLs)")]
+    Routes -->|"Service-Role Client"| Edge["Edge Function (validate-upload)"]
 ```
 
-The service-role key is used **only** in server-side code and the Python CLI.
-The browser upload step (below) uses the **anon key only**, scoped to a
-Storage object the server already pre-authorized via a signed upload URL — it
-never gets the service-role key.
+1. **User Database Queries (RLS)**: API routes use the **Session-Aware Client** (`getSupabaseSessionClient()`), which reads the user's Auth session cookie and passes their JWT to PostgreSQL. Postgres enforces Row Level Security (RLS), guaranteeing users only see/modify their own rows (`uploaded_by = auth.jwt() ->> 'email'`).
+2. **Storage & Administrative Operations**: The server uses the **Service-Role Client** (`getSupabaseServerClient()`) to issue temporary signed URLs for uploads/downloads and perform rollback cleanups.
+3. **Direct Browser Uploads**: The browser uploads directly to Storage using the **anon key + signed upload URL** issued by the server — it never touches the secret key.
 
-> **Important.** Never expose `SUPABASE_SERVICE_ROLE_KEY` (or any Supabase secret
-> key) in client-side code, GitHub, `.env.example`, or public documentation.
+> **Important.** Never expose `SUPABASE_SERVICE_ROLE_KEY` (or any Supabase secret key) in client-side code, GitHub, `.env.example`, or public documentation.
 
 ---
 
@@ -223,8 +220,8 @@ Client → POST /api/files/sign → validate filename/size → createSignedUploa
 - `GET /api/files/:id` returns the file metadata plus a **signed download URL**
   (expires after **60 seconds**).
 
-**UPDATE** — `PUT /api/files/:id` can update `filename`, `uploaded_by`, `notes`,
-and/or a replacement file. If a replacement file is provided, it's uploaded to
+**UPDATE** — `PUT /api/files/:id` can update `filename`, `notes`,
+and/or a replacement file. (`uploaded_by` is stamped automatically from the authenticated user's session during upload). If a replacement file is provided, it's uploaded to
 the **same storage path** (`upsert: true`), the metadata is updated, and the
 row is revalidated.
 
@@ -240,21 +237,24 @@ DocVault/
 ├── app/
 │   ├── api/
 │   │   └── files/
-│   │       ├── route.ts            GET list only
+│   │       ├── route.ts            GET list (filtered by RLS to logged-in user)
 │   │       ├── sign/
 │   │       │   └── route.ts        POST — validate + issue signed upload URL
 │   │       ├── finalize/
-│   │       │   └── route.ts        POST — insert metadata + validate-upload
+│   │       │   └── route.ts        POST — insert metadata (uploaded_by = user.email) + validate-upload
 │   │       └── [id]/
 │   │           └── route.ts        GET read+signed URL · PUT update · DELETE
-│   ├── page.tsx                    main UI (list, toasts, modal state)
+│   ├── login/
+│   │   └── page.tsx                email/password sign-in and sign-up page
+│   ├── page.tsx                    main UI (list, toasts, modal state, header logout)
 │   ├── layout.tsx
 │   └── globals.css
 │
 ├── components/
-│   ├── FileUploadForm.tsx          drag-and-drop upload, direct-to-Storage
+│   ├── FileUploadForm.tsx          drag-and-drop upload, direct-to-Storage, optional notes
 │   ├── FileTable.tsx               file list + per-row actions
 │   ├── EditMetadataModal.tsx       edit metadata / replace file
+│   ├── LogoutButton.tsx            sign-out button calling supabase.auth.signOut()
 │   └── ui/                         shadcn/Radix primitives
 │       ├── badge.tsx
 │       ├── button.tsx
@@ -278,11 +278,12 @@ DocVault/
 │   ├── types.ts                    shared types
 │   ├── utils.ts                    cn / formatBytes / formatDate
 │   └── supabase/
-│       ├── client.ts               browser client (anon key)
-│       └── server.ts               server client (service role, server-only)
+│       ├── client.ts               browser client (createBrowserClient from @supabase/ssr)
+│       └── server.ts               server clients (service role + session-aware getSupabaseSessionClient)
 │
 ├── supabase/
 │   ├── schema.sql                  table + RLS + bucket
+│   ├── rls_migration.sql           migration script for per-user RLS policies
 │   ├── config.toml
 │   └── functions/
 │       ├── _shared/
@@ -295,6 +296,7 @@ DocVault/
 │   ├── requirements.txt
 │   └── .env.example
 │
+├── middleware.ts                   auth session refresh + route protection redirects
 ├── .env.example
 ├── .env.local
 ├── .gitignore
@@ -330,8 +332,8 @@ The schema creates:
 - the `pgcrypto` extension (for `gen_random_uuid()`),
 - the `files_metadata` table,
 - an `updated_at` auto-update trigger,
-- Row Level Security,
-- a development RLS policy,
+- table-level permissions (GRANTs) for `authenticated` and `service_role`,
+- per-user Row Level Security (RLS) policies based on `uploaded_by = auth.jwt() ->> 'email'`,
 - the private `documents` Storage bucket.
 
 Table structure:
@@ -343,7 +345,7 @@ Table structure:
 | `storage_path` | `text` | Storage object path |
 | `file_type` | `text` | MIME type / extension |
 | `file_size` | `bigint` | File size in bytes |
-| `uploaded_by` | `text` | Optional uploader identifier |
+| `uploaded_by` | `text` | Uploader email (stamped from auth session) |
 | `uploaded_at` | `timestamptz` | Upload timestamp |
 | `updated_at` | `timestamptz` | Last update timestamp |
 | `validated` | `boolean` | Edge Function validation status |
@@ -351,33 +353,37 @@ Table structure:
 
 ---
 
-##  Row Level Security
+##  Row Level Security & Authentication
 
-RLS is enabled on `files_metadata`. For development, the project uses a
-permissive policy:
+RLS is enabled on `files_metadata` with strict per-user access control based on Supabase Authentication.
+
+When users sign in via email/password (`/login`), a session cookie is set. Every database access by the session-aware server client evaluates RLS using the user's authenticated email from their JWT token (`auth.jwt() ->> 'email'`).
+
+Per-user RLS policies:
 
 ```sql
-using (true)
-with check (true)
+create policy "users_select_own_files"
+  on public.files_metadata for select
+  to authenticated
+  using (uploaded_by = auth.jwt() ->> 'email');
+
+create policy "users_insert_own_files"
+  on public.files_metadata for insert
+  to authenticated
+  with check (uploaded_by = auth.jwt() ->> 'email');
+
+create policy "users_update_own_files"
+  on public.files_metadata for update
+  to authenticated
+  using (uploaded_by = auth.jwt() ->> 'email');
+
+create policy "users_delete_own_files"
+  on public.files_metadata for delete
+  to authenticated
+  using (uploaded_by = auth.jwt() ->> 'email');
 ```
 
-This is intentionally convenient for development/testing.
-
-> **Production warning.** The permissive policy should **not** be used for a
-> production application with real users. Before going to production:
-> - Use Supabase Authentication.
-> - Add a user identifier such as `user_id uuid references auth.users(id)`.
-> - Restrict rows using `auth.uid()`.
-> - Add Storage policies based on authenticated users.
-> - Do not allow unrestricted anonymous access.
->
-> Example production-style policy:
-> ```sql
-> using (auth.uid() = user_id)
-> with check (auth.uid() = user_id)
-> ```
-> The exact production policy should be designed according to the
-> application's authentication model.
+To apply these policies to an existing Supabase instance, run [`supabase/rls_migration.sql`](supabase/rls_migration.sql) in the Supabase SQL Editor.
 
 ---
 
@@ -653,15 +659,13 @@ SUPABASE_EDGE_FUNCTION_URL=https://<project-ref>.functions.supabase.co/validate-
 
 ##  Supabase client setup
 
-The application has two Supabase clients:
+The application has clients for both browser and server context, powered by `@supabase/ssr`:
 
 - **Browser client** — [`lib/supabase/client.ts`](lib/supabase/client.ts) —
-  uses `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. Safe
-  for browser-side use. Used for the direct-to-Storage upload PUT.
-- **Server client** — [`lib/supabase/server.ts`](lib/supabase/server.ts) —
-  uses the server-side service-role key. Must **never** be imported into a
-  Client Component; it imports `server-only` so the bundler errors if it ever
-  leaks into client code.
+  uses `createBrowserClient` from `@supabase/ssr` with `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. Handles cookie-based session persistence in the browser.
+- **Server clients** — [`lib/supabase/server.ts`](lib/supabase/server.ts) —
+  - `getSupabaseSessionClient()` — session-aware client using `createServerClient` from `@supabase/ssr` which reads/writes auth cookies from `next/headers`. Used for user-scoped database queries (e.g. `GET /api/files`) where RLS must filter results to the authenticated user.
+  - `getSupabaseServerClient()` — service-role client using the secret key. Used exclusively for administrative operations (Storage object management, edge function validation calls, and rollback cleanup). Must **never** be exposed to client-side code.
 
 ---
 
@@ -683,8 +687,7 @@ Open http://localhost:3000. Make sure `.env.local` is populated first.
 
 **`app/api/files/route.ts`**
 
-- `GET` — lists all records from `files_metadata`. (No longer handles
-  uploads — see `sign/` and `finalize/` below.)
+- `GET` — lists records from `files_metadata` using `getSupabaseSessionClient()`. RLS restricts returned rows strictly to those uploaded by the currently logged-in user.
 
 **`app/api/files/sign/route.ts`**
 
@@ -694,11 +697,8 @@ Open http://localhost:3000. Make sure `.env.local` is populated first.
 
 **`app/api/files/finalize/route.ts`**
 
-- `POST` — accepts JSON `{ storagePath, filename, fileSize, fileType,
-  uploadedBy?, notes? }` (called after the browser has already uploaded the
-  bytes to Storage). Inserts the metadata row, calls `validate-upload`, and
-  returns the validated row — rolling back the Storage object and row if
-  validation fails.
+- `POST` — accepts JSON `{ storagePath, filename, fileSize, fileType, notes? }`
+  (called after the browser has uploaded bytes to Storage). Gets the authenticated user's email from the session (`user.email`), sets `uploaded_by = user.email` server-side, inserts the metadata row, calls `validate-upload`, and returns the validated row.
 
 **`app/api/files/[id]/route.ts`**
 
