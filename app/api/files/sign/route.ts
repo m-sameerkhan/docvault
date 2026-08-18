@@ -63,6 +63,7 @@ export async function POST(req: NextRequest) {
       fileType: validation.fileType,
       path: data.path,
       token: data.token,
+      signedUrl: data.signedUrl,
     });
   } catch (err) {
     return NextResponse.json(

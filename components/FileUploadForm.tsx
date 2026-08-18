@@ -15,8 +15,7 @@ import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 
 import { cn, formatBytes } from "@/lib/utils";
-import { ALLOWED_EXTENSIONS, DOCUMENTS_BUCKET, MAX_FILE_SIZE, getFileExtension } from "@/lib/files";
-import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { ALLOWED_EXTENSIONS, MAX_FILE_SIZE, getFileExtension } from "@/lib/files";
 import type { FileMetadata } from "@/lib/types";
 
 type Props = {
@@ -48,20 +47,54 @@ function validateClientSide(file: File): string | null {
 
 type Phase = "signing" | "uploading" | "finalizing";
 
-const PHASE_LABEL: Record<Phase, string> = {
-  signing: "Preparing…",
-  // ponytail: uploadToSignedUrl goes through fetch, not XHR, so byte-level
-  // progress isn't available here — that's the tradeoff of routing bytes
-  // direct to Storage instead of through our own serverless function.
-  // Upgrade path if we need a real percentage back: raw XHR PUT to the
-  // signed URL instead of the supabase-js helper.
-  uploading: "Uploading…",
-  finalizing: "Validating…",
-};
+/**
+ * PUTs directly to a Supabase Storage signed upload URL with real progress
+ * events. This reconstructs the request body Supabase's own SDK sends
+ * internally for uploadToSignedUrl (multipart form with a "cacheControl"
+ * field and the file under an empty field name) — that shape isn't public
+ * API, just what the SDK does today, so verify this against a real upload
+ * after any supabase-js version bump.
+ *
+ * ponytail: if this ever drifts from what the SDK sends and starts
+ * failing, the safe fallback is uploadToSignedUrl() via the SDK (fetch-
+ * based, works, just no progress events).
+ */
+function uploadToSignedUrlWithProgress(
+  signedUrl: string,
+  file: File,
+  onProgress: (pct: number) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", signedUrl);
+
+    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+    xhr.setRequestHeader("apikey", anonKey);
+    xhr.setRequestHeader("Authorization", `Bearer ${anonKey}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+      } else {
+        reject(new Error(`Upload failed (${xhr.status}): ${xhr.responseText || "no response body"}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Network error while uploading to Storage."));
+
+    const body = new FormData();
+    body.append("cacheControl", "3600");
+    body.append("", file);
+    xhr.send(body);
+  });
+}
 
 export default function FileUploadForm({ onUploaded, onError }: Props) {
   const [isDragging, setIsDragging] = useState(false);
   const [phase, setPhase] = useState<Phase | null>(null);
+  const [progress, setProgress] = useState(0);
   const [activeFile, setActiveFile] = useState<{ name: string; size: number } | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [uploader, setUploader] = useState("");
@@ -83,6 +116,7 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
       }
       setLocalError(null);
       setActiveFile({ name: file.name, size: file.size });
+      setProgress(0);
 
       try {
         // 1. Ask the server to validate + issue a signed upload URL.
@@ -96,20 +130,13 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         if (!signRes.ok || !signBody.success) {
           throw new Error(signBody.error ?? "Failed to prepare upload.");
         }
-        const { storagePath, displayName, fileType, path, token } = signBody;
+        const { storagePath, displayName, fileType, signedUrl } = signBody;
 
         // 2. Upload the bytes straight to Supabase Storage — never through
-        // our serverless function, so file size isn't capped by it.
+        // our serverless function, so file size isn't capped by it. Raw
+        // XHR (not the SDK helper) so we get real progress events.
         setPhase("uploading");
-        const supabase = getSupabaseBrowserClient();
-        const { error: uploadError } = await supabase.storage
-          .from(DOCUMENTS_BUCKET)
-          .uploadToSignedUrl(path, token, file, {
-            contentType: file.type || "application/octet-stream",
-          });
-        if (uploadError) {
-          throw new Error(`Upload failed: ${uploadError.message}`);
-        }
+        await uploadToSignedUrlWithProgress(signedUrl, file, setProgress);
 
         // 3. Insert metadata + run edge-function validation.
         setPhase("finalizing");
@@ -167,6 +194,11 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
     }
   }, []);
 
+  const statusLabel =
+    phase === "signing" ? "Preparing…" :
+    phase === "uploading" ? `${progress}%` :
+    phase === "finalizing" ? "Validating…" : "";
+
   return (
     <Card className="p-3 sm:p-4">
       {/* Upload bar — short horizontal dropzone, not a tall empty square */}
@@ -211,13 +243,15 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
                 <p className="truncate text-sm font-medium text-foreground">{activeFile.name}</p>
                 <span className="shrink-0 text-xs text-muted-foreground">{formatBytes(activeFile.size)}</span>
               </div>
-              {/* Indeterminate — no byte-level progress once bytes go direct
-                  to Storage instead of through our own server. */}
-              <Progress value={undefined} className="mt-1.5 h-1" aria-label="Upload progress" />
+              <Progress
+                value={phase === "uploading" ? progress : phase === "finalizing" ? 100 : undefined}
+                className="mt-1.5 h-1"
+                aria-label="Upload progress"
+              />
             </div>
 
             <div className="flex shrink-0 items-center gap-3">
-              <span className="text-xs text-muted-foreground">{PHASE_LABEL[phase!]}</span>
+              <span className="text-xs text-muted-foreground">{statusLabel}</span>
             </div>
           </>
         ) : (
