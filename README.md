@@ -83,6 +83,9 @@ flowchart LR
 ```
 
 The service-role key is used **only** in server-side code and the Python CLI.
+The browser upload step (below) uses the **anon key only**, scoped to a
+Storage object the server already pre-authorized via a signed upload URL — it
+never gets the service-role key.
 
 > **Important.** Never expose `SUPABASE_SERVICE_ROLE_KEY` (or any Supabase secret
 > key) in client-side code, GitHub, `.env.example`, or public documentation.
@@ -91,36 +94,77 @@ The service-role key is used **only** in server-side code and the Python CLI.
 
 ## Upload flow
 
+Uploads are a **two-step, direct-to-Storage** flow, not a single multipart
+POST through our own server. See "Why direct-to-Storage uploads" below for
+why — short version: routing file bytes through a Vercel serverless function
+caps uploads at ~4.5 MB regardless of the app's own 10 MB limit, and larger
+files failed with an "invalid response" error. Bytes now go straight from the
+browser to Supabase Storage instead.
+
 ```mermaid
 sequenceDiagram
     actor User
     participant UI as Next.js UI
-    participant API as POST /api/files
+    participant Sign as POST /api/files/sign
     participant Storage as Supabase Storage
+    participant Finalize as POST /api/files/finalize
     participant DB as files_metadata
     participant Edge as validate-upload (Edge Function)
 
     User->>UI: Selects / drops a file
-    UI->>API: multipart/form-data upload
-    API->>Storage: upload(file, storage_path)
-    Storage-->>API: object stored
-    API->>DB: insert row (validated = false)
-    DB-->>API: row created
-    API->>Edge: POST { storage_path, filename, file_size, file_type }
+    UI->>Sign: { filename, size } (JSON, no bytes)
+    Sign->>Sign: validate extension + size
+    Sign->>Storage: createSignedUploadUrl(storage_path)
+    Storage-->>Sign: { signedUrl, path, token }
+    Sign-->>UI: { storagePath, signedUrl, ... }
+
+    UI->>Storage: PUT file bytes directly to signedUrl
+    Storage-->>UI: object stored
+
+    UI->>Finalize: { storagePath, filename, fileSize, fileType, ... } (JSON, no bytes)
+    Finalize->>DB: insert row (validated = false)
+    DB-->>Finalize: row created
+    Finalize->>Edge: POST { storage_path, filename, file_size, file_type }
 
     alt File passes validation (size ≤ 10 MB, allowed extension)
         Edge->>DB: update row → validated = true
-        Edge-->>API: { success: true, file: <updated row> }
-        API-->>UI: 201 Created, validated row
+        Edge-->>Finalize: { success: true, file: <updated row> }
+        Finalize-->>UI: 201 Created, validated row
         UI-->>User: Shown in table as "Validated"
     else File fails validation
         Edge->>Storage: remove(storage_path)
         Edge->>DB: delete row
-        Edge-->>API: { success: false, message }
-        API-->>UI: 400, error message
+        Edge-->>Finalize: { success: false, message }
+        Finalize-->>UI: 400, error message
         UI-->>User: Upload rejected toast, nothing added
     end
 ```
+
+### Why direct-to-Storage uploads
+
+Vercel Serverless Functions have a hard, non-configurable request body limit
+(~4.5 MB). The original design routed the file through `POST /api/files` as
+`multipart/form-data`, so any upload over that limit was rejected by Vercel
+before our own code — and our own 10 MB validation — ever ran. The failure
+showed up client-side as a generic "Server returned an invalid response"
+error, because Vercel's rejection isn't valid JSON.
+
+The fix splits the upload into two small JSON requests that never carry file
+bytes (`/sign` and `/finalize`), with the actual bytes going straight from
+the browser to Supabase Storage via a signed upload URL in between. Neither
+JSON request comes close to Vercel's limit regardless of file size, so the
+app's real ceiling is back to the intended 10 MB, enforced by
+`lib/files.ts`'s `validateFile`.
+
+**Trade-off:** the browser-to-Storage upload uses a raw `XMLHttpRequest` PUT
+(not the `supabase-js` `uploadToSignedUrl` helper, which is `fetch`-based and
+has no upload-progress events) so the UI can still show a real percentage.
+This means the client reconstructs the request body shape Supabase's SDK
+sends internally (`multipart/form-data` with a `cacheControl` field and the
+file under an empty field name) — that's implementation detail, not stable
+public API, so re-verify it against a real upload after any `@supabase/supabase-js`
+version bump. See the comment above `uploadToSignedUrlWithProgress` in
+`components/FileUploadForm.tsx`.
 
 ---
 
@@ -138,14 +182,16 @@ flowchart LR
 
     subgraph Routes["API Routes"]
         direction TB
-        R1["POST /api/files"]
+        R1a["POST /api/files/sign"]
+        R1b["POST /api/files/finalize"]
         R2["GET /api/files"]
         R3["GET /api/files/:id"]
         R4["PUT /api/files/:id"]
         R5["DELETE /api/files/:id"]
     end
 
-    U1 -->|CREATE| R1
+    U1 -->|"CREATE (sign)"| R1a
+    U1 -->|"CREATE (finalize)"| R1b
     U2 -->|"READ list"| R2
     U2 -->|"READ one + signed URL"| R3
     U3 -->|"UPDATE metadata / file"| R4
@@ -154,7 +200,7 @@ flowchart LR
 
 | Operation | Endpoint | Description |
 | --- | --- | --- |
-| Create | `POST /api/files` | Upload file + create metadata + validate |
+| Create | `POST /api/files/sign` then `POST /api/files/finalize` | Sign a Storage upload URL, browser uploads bytes directly, then insert metadata + validate |
 | Read list | `GET /api/files` | List all files |
 | Read one | `GET /api/files/:id` | Get metadata + signed download URL |
 | Update | `PUT /api/files/:id` | Update metadata and/or replace file |
@@ -163,8 +209,9 @@ flowchart LR
 **CREATE**
 
 ```
-Client → POST /api/files → Upload object to documents bucket
-       → Insert files_metadata row (validated = false)
+Client → POST /api/files/sign → validate filename/size → createSignedUploadUrl
+       → Client uploads bytes directly to Supabase Storage via the signed URL
+       → POST /api/files/finalize → insert files_metadata row (validated = false)
        → Call validate-upload Edge Function
        → Valid?  Yes → validated = true
                  No  → delete Storage object + metadata row
@@ -193,7 +240,11 @@ DocVault/
 ├── app/
 │   ├── api/
 │   │   └── files/
-│   │       ├── route.ts            GET list · POST create
+│   │       ├── route.ts            GET list only
+│   │       ├── sign/
+│   │       │   └── route.ts        POST — validate + issue signed upload URL
+│   │       ├── finalize/
+│   │       │   └── route.ts        POST — insert metadata + validate-upload
 │   │       └── [id]/
 │   │           └── route.ts        GET read+signed URL · PUT update · DELETE
 │   ├── page.tsx                    main UI (list, toasts, modal state)
@@ -201,7 +252,7 @@ DocVault/
 │   └── globals.css
 │
 ├── components/
-│   ├── FileUploadForm.tsx          drag-and-drop upload
+│   ├── FileUploadForm.tsx          drag-and-drop upload, direct-to-Storage
 │   ├── FileTable.tsx               file list + per-row actions
 │   ├── EditMetadataModal.tsx       edit metadata / replace file
 │   └── ui/                         shadcn/Radix primitives
@@ -335,8 +386,11 @@ This is intentionally convenient for development/testing.
 - Bucket: `documents`
 - Public: **OFF** — the bucket must remain private.
 
-Files are accessed using **signed URLs**, never public URLs. In Supabase:
-**Storage → Buckets → documents → Public = OFF**.
+Files are accessed and written using **signed URLs**, never public URLs — a
+signed URL for **downloads** (60-second expiry, generated per read), and a
+signed **upload** URL (via `createSignedUploadUrl`) that authorizes a single
+write to a specific `storage_path` without exposing the service-role key to
+the browser. In Supabase: **Storage → Buckets → documents → Public = OFF**.
 
 The SQL schema creates the bucket automatically:
 
@@ -345,6 +399,11 @@ insert into storage.buckets (id, name, public)
 values ('documents', 'documents', false)
 on conflict (id) do nothing;
 ```
+
+> If the browser-direct upload step (`uploadToSignedUrl` / a PUT to a signed
+> upload URL) fails with a permissions error even though the URL itself was
+> issued successfully, check that the bucket's storage policies actually
+> allow uploads via a signed-upload token, not just service-role writes.
 
 ---
 
@@ -355,8 +414,9 @@ on conflict (id) do nothing;
 - Expected MIME types include: `application/pdf`, `image/png`, `image/jpeg`,
   `text/plain`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
 
-The application validates the file **on the server**, and again through the
-**Edge Function**. Client-side validation is only for user experience —
+The application validates the file **on the server** (`/api/files/sign`,
+before a signed upload URL is even issued), and again through the **Edge
+Function** after upload. Client-side validation is only for user experience —
 server-side validation is required for security.
 
 ---
@@ -400,7 +460,12 @@ It:
 1. Validates the file size.
 2. Validates the file type/extension.
 3. Finds the metadata row.
-4. Marks valid uploads as `validated = true`, `notes = "Validated by edge function"`.
+4. Marks valid uploads as `validated = true`. It does **not** touch `notes` —
+   an earlier version overwrote `notes` with `"Validated by edge function"`
+   on every successful validation, silently discarding whatever the uploader
+   had written. If you see that string reappearing in `notes`, the update
+   payload in `index.ts` has regressed; it should update `validated` and
+   `updated_at` only.
 5. Deletes invalid Storage objects **and** invalid metadata rows.
 6. Returns JSON.
 
@@ -483,8 +548,8 @@ in the `documents` bucket, with an **existing** corresponding row in
 create one.
 
 **PowerShell test** — bash's `\` line continuation doesn't work in
-PowerShell; use a backtick `` ` `` if you want to split lines, or keep it on
-one line:
+PowerShell, and stray trailing spaces after a backtick `` ` `` silently break
+the continuation too. Splatting avoids both problems:
 
 ```powershell
 $body = @{
@@ -510,7 +575,9 @@ Invoke-RestMethod @params
 
 Do not put your real secret key into source control.
 
-**curl test:**
+**curl test** (Git Bash / WSL / macOS / Linux — this syntax does **not** work
+in native PowerShell, where `curl` is aliased to `Invoke-WebRequest` and
+doesn't understand `-H`/`-d`):
 
 ```bash
 curl -X POST "https://<project-ref>.functions.supabase.co/validate-upload" \
@@ -534,6 +601,11 @@ curl -X POST "https://<project-ref>.functions.supabase.co/validate-upload" \
 The Edge Function should reject the file and roll back the Storage object and
 metadata row.
 
+> **Careful:** a successful rejection test **deletes** the Storage object and
+> metadata row at that `storage_path`. Don't point it at a file/row you want
+> to keep — use a disposable test upload, or reset a row's `validated` flag
+> to `false` first if you're only testing the success path.
+
 ---
 
 ## Edge Function troubleshooting
@@ -544,6 +616,7 @@ metadata row.
 | `permission denied for table files_metadata` | Run the `GRANT` statement from #-supabase-database-permissions |
 | `Cannot coerce the result to a single JSON object` | The function didn't find a corresponding `files_metadata` row while using `.single()` — a standalone validation request against a nonexistent `storage_path` isn't a valid test; the metadata row must already exist from a real upload |
 | `supabase functions invoke` not available | Some CLI versions don't ship it — use the PowerShell/curl HTTP test in [section 10](#10-testing-the-edge-function) instead |
+| `notes` gets overwritten with `"Validated by edge function"` on every valid upload | Regression of a fixed bug — the success-path `.update({...})` in `validate-upload/index.ts` must not include a `notes` key |
 
 ---
 
@@ -563,13 +636,18 @@ SUPABASE_EDGE_FUNCTION_URL=https://<project-ref>.functions.supabase.co/validate-
 | Variable | Purpose | Exposure |
 | --- | --- | --- |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL | Browser-safe |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Public/anon client key | Browser-safe |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Public/anon client key — used by the browser both for the direct-to-Storage upload PUT and general client-side Supabase calls | Browser-safe |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-side database/storage access | Server only |
 | `SUPABASE_EDGE_FUNCTION_URL` | Edge Function endpoint | Server only |
 
 > **Important.** Never expose `SUPABASE_SERVICE_ROLE_KEY` to Client
 > Components. Never put it in a `NEXT_PUBLIC_*` variable. Never commit it to
 > GitHub.
+>
+> **Vercel:** `.env.local` is not read by Vercel. Add the same variables in
+> Project → Settings → Environment Variables for Production, Preview, and
+> Development, then redeploy — a missing variable here is the most common
+> cause of "works locally, breaks on Vercel."
 
 ---
 
@@ -579,7 +657,7 @@ The application has two Supabase clients:
 
 - **Browser client** — [`lib/supabase/client.ts`](lib/supabase/client.ts) —
   uses `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. Safe
-  for browser-side use.
+  for browser-side use. Used for the direct-to-Storage upload PUT.
 - **Server client** — [`lib/supabase/server.ts`](lib/supabase/server.ts) —
   uses the server-side service-role key. Must **never** be imported into a
   Client Component; it imports `server-only` so the bundler errors if it ever
@@ -587,7 +665,7 @@ The application has two Supabase clients:
 
 ---
 
-## 14. Next.js application setup
+##  Next.js application setup
 
 ```bash
 npm install
@@ -605,10 +683,21 @@ Open http://localhost:3000. Make sure `.env.local` is populated first.
 
 **`app/api/files/route.ts`**
 
-- `GET` — lists all records from `files_metadata`.
-- `POST` — accepts `multipart/form-data`. Receives the uploaded file, checks
-  it, creates a storage path, uploads to `documents`, inserts metadata, calls
-  `validate-upload`, returns the final metadata row, and rolls back if
+- `GET` — lists all records from `files_metadata`. (No longer handles
+  uploads — see `sign/` and `finalize/` below.)
+
+**`app/api/files/sign/route.ts`**
+
+- `POST` — accepts JSON `{ filename, size }` (no file bytes). Validates the
+  file server-side, builds a storage path, and returns a Supabase signed
+  upload URL the browser uploads directly to.
+
+**`app/api/files/finalize/route.ts`**
+
+- `POST` — accepts JSON `{ storagePath, filename, fileSize, fileType,
+  uploadedBy?, notes? }` (called after the browser has already uploaded the
+  bytes to Storage). Inserts the metadata row, calls `validate-upload`, and
+  returns the validated row — rolling back the Storage object and row if
   validation fails.
 
 **`app/api/files/[id]/route.ts`**
@@ -626,7 +715,9 @@ Open http://localhost:3000. Make sure `.env.local` is populated first.
 Main interface: [`app/page.tsx`](app/page.tsx). Components:
 
 - [`components/FileUploadForm.tsx`](components/FileUploadForm.tsx) — drag and
-  drop, file browser, client + server validation, upload progress, success
+  drop, file browser, optional uploader/notes fields, client + server
+  validation, direct-to-Storage upload with real progress (raw XHR PUT to a
+  signed upload URL — see "Why direct-to-Storage uploads" above), success
   and error messaging.
 - [`components/FileTable.tsx`](components/FileTable.tsx) — filename, file
   size, file type, upload date, updated date, validation status, and
@@ -637,7 +728,9 @@ Main interface: [`app/page.tsx`](app/page.tsx). Components:
   (`button`, `card`, `dialog`, `dropdown-menu`, `input`, `label`, `progress`,
   `table`, `toast`, etc.) that the app above is built from.
 - [`hooks/use-toast.ts`](hooks/use-toast.ts) — the toast notification hook
-  used throughout the UI.
+  used throughout the UI. Toasts auto-dismiss via the Radix `Toast.Root`
+  primitive's own built-in timer (default ~5s) — the hook itself doesn't run
+  a separate auto-dismiss timer, only the click-to-dismiss and cleanup path.
 
 ---
 
@@ -647,6 +740,11 @@ The standalone Python CLI is located at
 [`python-cli/supabase_crud.py`](python-cli/supabase_crud.py).
 
 Requirements: **Python 3.11+**, `supabase-py`, `requests`, `python-dotenv`.
+
+Note: the Python CLI still uploads in a single step via the service-role key
+(`storage.from_(BUCKET).upload(...)`) — it isn't subject to Vercel's request
+size limit since it doesn't run on Vercel, so it doesn't need the sign/finalize
+split the web UI uses.
 
 ---
 
@@ -728,16 +826,25 @@ update  → file ID → metadata and/or replacement file → Storage update
 delete  → file ID → delete Storage object → delete metadata
 ```
 
-The Python application mirrors the web application end to end.
+The Python application mirrors the web application's end result (same
+Storage bucket, same table, same Edge Function), though its upload is
+single-step rather than the web UI's sign/finalize split — see the note
+under "Python terminal CRUD application" above.
 
 ---
 ##  API reference
 
 **`GET /api/files`** — returns all files.
 
-**`POST /api/files`** — uploads a new file. Content type: `multipart/form-data`,
-form field `file=<uploaded-file>`. The server handles the Storage upload,
-metadata insertion, and Edge Function validation.
+**`POST /api/files/sign`** — step 1 of upload. JSON body `{ filename, size }`.
+Validates the file and returns a signed Storage upload URL; carries no file
+bytes, so it's unaffected by Vercel's request body size limit regardless of
+the file's actual size.
+
+**`POST /api/files/finalize`** — step 2 of upload, called after the browser
+has uploaded bytes directly to Storage using the signed URL from `/sign`.
+JSON body `{ storagePath, filename, fileSize, fileType, uploadedBy?, notes?
+}`. Inserts the metadata row and runs Edge Function validation.
 
 **`GET /api/files/:id`** — returns one file: metadata plus a signed download
 URL (expires after 60 seconds).
@@ -799,6 +906,8 @@ Click **Deploy**. Vercel runs the Next.js build and deploys the application.
 | Edge Function permission error | Run the `GRANT` statement |
 | Edge Function says no metadata row exists | Test with a real uploaded file's `storage_path`, not an arbitrary one |
 | Next.js can't read env vars | Confirm `.env.local` is next to `package.json`, restart `npm run dev` |
+| Upload works locally but fails on Vercel with "Server returned an invalid response" for files over a few MB | Vercel's serverless function body limit (~4.5 MB) rejects the request before your code runs. Fixed by the sign/finalize direct-to-Storage flow — confirm you're not back on a single `multipart/form-data` `POST /api/files` upload path |
+| Works locally, breaks only after deploying to Vercel | Almost always missing environment variables — `.env.local` isn't read by Vercel; add the same vars in the Vercel dashboard and redeploy |
 ---
 
 ##  Development checklist
@@ -811,6 +920,7 @@ Click **Deploy**. Vercel runs the Next.js build and deploys the application.
 - [ ] `documents` bucket exists and is private
 - [ ] Storage MIME types configured
 - [ ] Service-role permissions verified
+- [ ] Storage policy allows uploads via signed upload tokens (not just service-role writes)
 
 **Edge Function**
 - [ ] `validate-upload` created
@@ -818,13 +928,14 @@ Click **Deploy**. Vercel runs the Next.js build and deploys the application.
 - [ ] Function deployed and shows `ACTIVE`
 - [ ] Environment variables available
 - [ ] Validation tested
+- [ ] Success-path update does **not** overwrite `notes`
 
 **Next.js**
 - [ ] Dependencies installed
 - [ ] `.env.local` configured
-- [ ] Supabase clients created
-- [ ] API routes implemented
-- [ ] Upload UI implemented
+- [ ] Supabase clients created (browser + server)
+- [ ] `/api/files/sign` and `/api/files/finalize` implemented
+- [ ] Upload UI implemented (with real progress + optional uploader/notes)
 - [ ] File table implemented
 - [ ] Edit modal implemented
 - [ ] Download / Replace / Delete all work
@@ -840,9 +951,8 @@ Click **Deploy**. Vercel runs the Next.js build and deploys the application.
 - [ ] Git repository created
 - [ ] Secrets excluded from Git
 - [ ] Vercel project created
-- [ ] Vercel environment variables added
+- [ ] Vercel environment variables added (Production, Preview, Development)
 - [ ] Production deployment successful
-- [ ] Production upload tested
+- [ ] Production upload tested with a file **over 4.5 MB** specifically
 
 ---
-
