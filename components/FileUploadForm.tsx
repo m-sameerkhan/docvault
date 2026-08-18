@@ -6,7 +6,6 @@ import {
   Image as ImageIcon,
   FileType2,
   UploadCloud,
-  X,
 } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
@@ -16,7 +15,8 @@ import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 
 import { cn, formatBytes } from "@/lib/utils";
-import { ALLOWED_EXTENSIONS, MAX_FILE_SIZE, getFileExtension } from "@/lib/files";
+import { ALLOWED_EXTENSIONS, DOCUMENTS_BUCKET, MAX_FILE_SIZE, getFileExtension } from "@/lib/files";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import type { FileMetadata } from "@/lib/types";
 
 type Props = {
@@ -46,43 +46,30 @@ function validateClientSide(file: File): string | null {
   return null;
 }
 
-/** Uploads with real progress events via XHR (fetch has no upload progress). */
-function uploadWithProgress(
-  formData: FormData,
-  onProgress: (pct: number) => void,
-  xhrRef: React.MutableRefObject<XMLHttpRequest | null>,
-): Promise<{ ok: boolean; body: any }> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
-    xhr.open("POST", "/api/files");
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-    xhr.onload = () => {
-      try {
-        resolve({ ok: xhr.status >= 200 && xhr.status < 300, body: JSON.parse(xhr.responseText) });
-      } catch {
-        resolve({ ok: false, body: { error: "Server returned an invalid response." } });
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error during upload."));
-    xhr.onabort = () => reject(new Error("__aborted__"));
-    xhr.send(formData);
-  });
-}
+type Phase = "signing" | "uploading" | "finalizing";
+
+const PHASE_LABEL: Record<Phase, string> = {
+  signing: "Preparing…",
+  // ponytail: uploadToSignedUrl goes through fetch, not XHR, so byte-level
+  // progress isn't available here — that's the tradeoff of routing bytes
+  // direct to Storage instead of through our own serverless function.
+  // Upgrade path if we need a real percentage back: raw XHR PUT to the
+  // signed URL instead of the supabase-js helper.
+  uploading: "Uploading…",
+  finalizing: "Validating…",
+};
 
 export default function FileUploadForm({ onUploaded, onError }: Props) {
   const [isDragging, setIsDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [phase, setPhase] = useState<Phase | null>(null);
   const [activeFile, setActiveFile] = useState<{ name: string; size: number } | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [uploader, setUploader] = useState("");
-  const [showUploader, setShowUploader] = useState(false);
+  const [notes, setNotes] = useState("");
+  const [showDetails, setShowDetails] = useState(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
-  const xhrRef = useRef<XMLHttpRequest | null>(null);
+  const uploading = phase !== null;
 
   const submitFiles = useCallback(
     async (files: FileList | null) => {
@@ -95,40 +82,67 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         return;
       }
       setLocalError(null);
-
-      const formData = new FormData();
-      formData.append("file", file);
-      if (uploader.trim()) formData.append("uploaded_by", uploader.trim());
-
-      setUploading(true);
-      setProgress(0);
       setActiveFile({ name: file.name, size: file.size });
 
       try {
-        const { ok, body } = await uploadWithProgress(formData, setProgress, xhrRef);
-        if (!ok || !body.success) {
-          throw new Error(body.error ?? "Upload failed.");
+        // 1. Ask the server to validate + issue a signed upload URL.
+        setPhase("signing");
+        const signRes = await fetch("/api/files/sign", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: file.name, size: file.size }),
+        });
+        const signBody = await signRes.json();
+        if (!signRes.ok || !signBody.success) {
+          throw new Error(signBody.error ?? "Failed to prepare upload.");
         }
-        onUploaded(body.data as FileMetadata);
+        const { storagePath, displayName, fileType, path, token } = signBody;
+
+        // 2. Upload the bytes straight to Supabase Storage — never through
+        // our serverless function, so file size isn't capped by it.
+        setPhase("uploading");
+        const supabase = getSupabaseBrowserClient();
+        const { error: uploadError } = await supabase.storage
+          .from(DOCUMENTS_BUCKET)
+          .uploadToSignedUrl(path, token, file, {
+            contentType: file.type || "application/octet-stream",
+          });
+        if (uploadError) {
+          throw new Error(`Upload failed: ${uploadError.message}`);
+        }
+
+        // 3. Insert metadata + run edge-function validation.
+        setPhase("finalizing");
+        const finalizeRes = await fetch("/api/files/finalize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            storagePath,
+            filename: displayName,
+            fileSize: file.size,
+            fileType,
+            uploadedBy: uploader.trim() || null,
+            notes: notes.trim() || null,
+          }),
+        });
+        const finalizeBody = await finalizeRes.json();
+        if (!finalizeRes.ok || !finalizeBody.success) {
+          throw new Error(finalizeBody.error ?? "Upload failed.");
+        }
+
+        onUploaded(finalizeBody.data as FileMetadata);
       } catch (err) {
         const message = err instanceof Error ? err.message : "An unexpected error occurred during upload.";
-        if (message !== "__aborted__") {
-          setLocalError(message);
-          onError(message);
-        }
+        setLocalError(message);
+        onError(message);
       } finally {
-        setUploading(false);
+        setPhase(null);
         setActiveFile(null);
-        xhrRef.current = null;
         if (inputRef.current) inputRef.current.value = "";
       }
     },
-    [uploader, onUploaded, onError],
+    [uploader, notes, onUploaded, onError],
   );
-
-  const cancelUpload = useCallback(() => {
-    xhrRef.current?.abort();
-  }, []);
 
   const onDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -197,22 +211,13 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
                 <p className="truncate text-sm font-medium text-foreground">{activeFile.name}</p>
                 <span className="shrink-0 text-xs text-muted-foreground">{formatBytes(activeFile.size)}</span>
               </div>
-              <Progress value={progress} className="mt-1.5 h-1" aria-label="Upload progress" />
+              {/* Indeterminate — no byte-level progress once bytes go direct
+                  to Storage instead of through our own server. */}
+              <Progress value={undefined} className="mt-1.5 h-1" aria-label="Upload progress" />
             </div>
 
             <div className="flex shrink-0 items-center gap-3">
-              <span className="text-xs text-muted-foreground">{progress < 100 ? `${progress}%` : "Validating…"}</span>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  cancelUpload();
-                }}
-                aria-label="Cancel upload"
-                className="text-muted-foreground hover:text-destructive"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <span className="text-xs text-muted-foreground">{PHASE_LABEL[phase!]}</span>
             </div>
           </>
         ) : (
@@ -262,11 +267,11 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         )}
       </div>
 
-      {/* Uploader — collapsed by default so it doesn't add height to the common case */}
+      {/* Uploader + notes — collapsed by default so it doesn't add height to the common case */}
       <div className="mt-2">
-        {showUploader ? (
+        {showDetails ? (
           <div className="flex flex-wrap items-end gap-2">
-            <div className="flex-1">
+            <div className="flex-1 basis-52">
               <Label htmlFor="uploader" className="mb-1 block text-xs font-medium">
                 Uploader <span className="font-normal text-muted-foreground">(optional)</span>
               </Label>
@@ -281,10 +286,24 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
                 className="h-8 w-full text-sm sm:w-64"
               />
             </div>
-            {!uploader && (
+            <div className="flex-1 basis-52">
+              <Label htmlFor="notes" className="mb-1 block text-xs font-medium">
+                Notes <span className="font-normal text-muted-foreground">(optional)</span>
+              </Label>
+              <Input
+                id="notes"
+                type="text"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="e.g. Q3 report"
+                disabled={uploading}
+                className="h-8 w-full text-sm sm:w-64"
+              />
+            </div>
+            {!uploader && !notes && (
               <button
                 type="button"
-                onClick={() => setShowUploader(false)}
+                onClick={() => setShowDetails(false)}
                 className="mb-1.5 text-xs text-muted-foreground hover:text-foreground"
               >
                 Cancel
@@ -294,10 +313,12 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         ) : (
           <button
             type="button"
-            onClick={() => setShowUploader(true)}
+            onClick={() => setShowDetails(true)}
             className="text-xs font-medium text-muted-foreground hover:text-primary"
           >
-            {uploader ? `Uploader: ${uploader}` : "+ Add uploader (optional)"}
+            {uploader || notes
+              ? [uploader && `Uploader: ${uploader}`, notes && `Notes: ${notes}`].filter(Boolean).join(" · ")
+              : "+ Add uploader / notes (optional)"}
           </button>
         )}
       </div>

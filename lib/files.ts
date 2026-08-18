@@ -21,7 +21,11 @@ export function getFileExtension(filename: string): string {
   return ext.toLowerCase();
 }
 
-export function validateFile(file: File): ValidationResult {
+// Takes { name, size } rather than a real File — the /api/files/sign route
+// validates before any bytes exist on the server (they go straight from the
+// browser to Storage), and a real File satisfies this shape too, so nothing
+// else needs to change.
+export function validateFile(file: { name: string; size: number }): ValidationResult {
   const fileType = getFileExtension(file.name);
   if (!ALLOWED_EXTENSIONS.has(fileType)) {
     return {
