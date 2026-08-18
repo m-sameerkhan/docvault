@@ -1,16 +1,8 @@
 // app/api/files/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
-import {
-  getSupabaseServerClient,
-  EDGE_FUNCTION_URL,
-} from "@/lib/supabase/server";
-import {
-  DOCUMENTS_BUCKET,
-  buildStoragePath,
-  sanitizeFilename,
-  validateFile,
-} from "@/lib/files";
+import { getSupabaseServerClient, DOCUMENTS_BUCKET, EDGE_FUNCTION_URL } from "@/lib/supabase/server";
+import { validateFileMeta } from "@/lib/files";
 
 export const dynamic = "force-dynamic";
 
@@ -28,300 +20,155 @@ export async function GET() {
       .order("uploaded_at", { ascending: false });
 
     if (error) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: error.message,
-        },
-        { status: 500 },
-      );
+      return NextResponse.json({ success: false, error: error.message }, { status: 500 });
     }
 
-    return NextResponse.json({
-      success: true,
-      data,
-    });
+    return NextResponse.json({ success: true, data });
   } catch (err) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: (err as Error).message,
-      },
-      { status: 500 },
-    );
+    return NextResponse.json({ success: false, error: (err as Error).message }, { status: 500 });
   }
 }
 
 /**
  * POST /api/files
  *
- * Upload flow:
+ * Step 2 of the upload flow. The browser has ALREADY uploaded the file
+ * bytes directly to Supabase Storage using a signed URL from
+ * /api/files/upload-url. This route only:
  *
- * 1. Upload file to Supabase Storage.
- * 2. Insert metadata row with validated = false.
- * 3. Call validate-upload Edge Function.
- * 4. Edge Function validates the file and updates validated = true.
- * 5. Fetch the UPDATED metadata row.
- * 6. Return the updated row to the frontend.
+ * 1. Re-validates the reported size/type (defence in depth).
+ * 2. Inserts the metadata row (validated = false).
+ * 3. Calls validate-upload Edge Function.
+ * 4. Fetches and returns the updated row.
+ *
+ * Body (application/json):
+ * { storage_path, filename, file_size, file_type, uploaded_by?, notes? }
  */
 export async function POST(req: NextRequest) {
   const supabase = getSupabaseServerClient();
 
   try {
-    const formData = await req.formData();
+    const body = await req.json();
+    const storagePath = body.storage_path as string;
+    const displayName = body.filename as string;
+    const fileSize = Number(body.file_size);
+    const uploadedBy = (body.uploaded_by as string)?.trim() || null;
+    const notes = (body.notes as string)?.trim() || null;
 
-    const file = formData.get("file");
-
-    const uploadedBy =
-      (formData.get("uploaded_by") as string)?.trim() || null;
-
-    const notes =
-      (formData.get("notes") as string)?.trim() || null;
-
-    const customName =
-      (formData.get("filename") as string)?.trim() || null;
-
-    // --------------------------------------------------
-    // 1. Validate uploaded file exists
-    // --------------------------------------------------
-
-    if (!(file instanceof File)) {
+    if (!storagePath || !displayName || !Number.isFinite(fileSize)) {
       return NextResponse.json(
-        {
-          success: false,
-          error: "No file provided.",
-        },
+        { success: false, error: "storage_path, filename, and file_size are required." },
         { status: 400 },
       );
     }
 
-    // --------------------------------------------------
-    // 2. Validate file
-    // --------------------------------------------------
-
-    const validation = validateFile(file);
-
+    
+    // Re-validate (the client already checked, but never trust the client)
+    const validation = validateFileMeta({ name: displayName, size: fileSize });
     if (!validation.ok) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: validation.error,
-        },
-        { status: 400 },
-      );
+      // The object may already be sitting in Storage from step 1 — clean it up.
+      await supabase.storage.from(DOCUMENTS_BUCKET).remove([storagePath]);
+      return NextResponse.json({ success: false, error: validation.error }, { status: 400 });
     }
 
-    // --------------------------------------------------
-    // 3. Prepare file information
-    // --------------------------------------------------
-
-    const displayName = sanitizeFilename(
-      customName ?? file.name,
-    );
-
-    const storagePath = buildStoragePath(file.name);
-
-    // --------------------------------------------------
-    // 4. Upload file to Supabase Storage
-    // --------------------------------------------------
-
-    const { error: uploadError } = await supabase.storage
-      .from(DOCUMENTS_BUCKET)
-      .upload(storagePath, file, {
-        contentType:
-          file.type || "application/octet-stream",
-        upsert: false,
-      });
-
-    if (uploadError) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: `Storage upload failed: ${uploadError.message}`,
-        },
-        { status: 500 },
-      );
-    }
-
-    // --------------------------------------------------
-    // 5. Insert metadata row
-    // --------------------------------------------------
-
-    const { error: insertError } = await supabase
-      .from("files_metadata")
-      .insert({
-        filename: displayName,
-        storage_path: storagePath,
-        file_type: validation.fileType,
-        file_size: file.size,
-        uploaded_by: uploadedBy,
-        notes,
-        validated: false,
-      });
+    // Insert metadata row
+    
+    const { error: insertError } = await supabase.from("files_metadata").insert({
+      filename: displayName,
+      storage_path: storagePath,
+      file_type: validation.fileType,
+      file_size: fileSize,
+      uploaded_by: uploadedBy,
+      notes,
+      validated: false,
+    });
 
     if (insertError) {
-      // Roll back Storage upload if database insert fails.
-      await supabase.storage
-        .from(DOCUMENTS_BUCKET)
-        .remove([storagePath]);
-
+      await supabase.storage.from(DOCUMENTS_BUCKET).remove([storagePath]);
       return NextResponse.json(
-        {
-          success: false,
-          error: `Metadata insert failed: ${insertError.message}`,
-        },
+        { success: false, error: `Metadata insert failed: ${insertError.message}` },
         { status: 500 },
       );
     }
 
-    // --------------------------------------------------
-    // 6. Call validation Edge Function
-    // --------------------------------------------------
-
+    
+    // Call validation Edge Function
+    
     const edgeResult = await callEdgeFunction({
       storage_path: storagePath,
       filename: displayName,
-      file_size: file.size,
+      file_size: fileSize,
       file_type: validation.fileType,
     });
 
-    // 7. Validation failed
-
     if (!edgeResult.ok) {
-      // Clean up Storage.
-      await supabase.storage
-        .from(DOCUMENTS_BUCKET)
-        .remove([storagePath]);
-
-      // Clean up metadata.
-      await supabase
-        .from("files_metadata")
-        .delete()
-        .eq("storage_path", storagePath);
+      await supabase.storage.from(DOCUMENTS_BUCKET).remove([storagePath]);
+      await supabase.from("files_metadata").delete().eq("storage_path", storagePath);
 
       return NextResponse.json(
-        {
-          success: false,
-          error: `Upload rejected by validation: ${edgeResult.message}`,
-        },
+        { success: false, error: `Upload rejected by validation: ${edgeResult.message}` },
         { status: 400 },
       );
     }
 
-    // 8. IMPORTANT:
-    // Fetch the UPDATED row after Edge Function validation.
-
-    const {
-      data: validatedRow,
-      error: fetchError,
-    } = await supabase
+    
+    // Fetch the UPDATED row after Edge Function validation
+    
+    const { data: validatedRow, error: fetchError } = await supabase
       .from("files_metadata")
       .select("*")
       .eq("storage_path", storagePath)
       .single();
 
     if (fetchError || !validatedRow) {
-      console.error(
-        "Failed to fetch validated metadata row:",
-        fetchError,
-      );
-
+      console.error("Failed to fetch validated metadata row:", fetchError);
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            fetchError?.message ??
-            "Failed to fetch validated file metadata.",
-        },
+        { success: false, error: fetchError?.message ?? "Failed to fetch validated file metadata." },
         { status: 500 },
       );
     }
 
-    // 9. Return the UPDATED row
-
     return NextResponse.json(
-      {
-        success: true,
-        message: "File uploaded and validated.",
-        data: validatedRow,
-      },
+      { success: true, message: "File uploaded and validated.", data: validatedRow },
       { status: 201 },
     );
   } catch (err) {
     console.error("POST /api/files error:", err);
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: (err as Error).message,
-      },
-      { status: 500 },
-    );
+    return NextResponse.json({ success: false, error: (err as Error).message }, { status: 500 });
   }
 }
-
- // Call validate-upload Edge Function.
 
 async function callEdgeFunction(payload: {
   storage_path: string;
   filename: string;
   file_size: number;
   file_type: string;
-}): Promise<{
-  ok: boolean;
-  message: string;
-}> {
-  // Check Edge Function URL
-
+}): Promise<{ ok: boolean; message: string }> {
   if (!EDGE_FUNCTION_URL) {
     return {
       ok: false,
-      message:
-        "SUPABASE_EDGE_FUNCTION_URL is not set. File stored but not validated.",
+      message: "SUPABASE_EDGE_FUNCTION_URL is not set. File stored but not validated.",
     };
   }
 
   try {
-    
-    // Call Edge Function
-
-    const res = await fetch(
-      EDGE_FUNCTION_URL,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-
-          Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`,
-        },
-        body: JSON.stringify(payload),
+    const res = await fetch(EDGE_FUNCTION_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`,
       },
-    );
+      body: JSON.stringify(payload),
+    });
 
-    // Parse response
-
-    const body = (await res.json()) as {
-      success: boolean;
-      message?: string;
-    };
+    const body = (await res.json()) as { success: boolean; message?: string };
 
     return {
       ok: res.ok && body.success,
-      message:
-        body.message ??
-        "Unknown validation response.",
+      message: body.message ?? "Unknown validation response.",
     };
   } catch (err) {
-    console.error(
-      "Edge function request failed:",
-      err,
-    );
-
-    return {
-      ok: false,
-      message: `Edge function unreachable: ${
-        (err as Error).message
-      }`,
-    };
+    console.error("Edge function request failed:", err);
+    return { ok: false, message: `Edge function unreachable: ${(err as Error).message}` };
   }
 }
