@@ -46,40 +46,29 @@ function validateClientSide(file: File): string | null {
   return null;
 }
 
-type UploadUrlResponse = {
-  success: boolean;
-  error?: string;
-  data?: {
-    signedUrl: string;
-    token: string;
-    storagePath: string;
-    displayName: string;
-    fileType: string;
-  };
-};
-
-/** PUT the raw file bytes directly to Supabase Storage's signed URL, with progress. */
-function putToSignedUrl(
-  signedUrl: string,
-  file: File,
+/** Uploads with real progress events via XHR (fetch has no upload progress). */
+function uploadWithProgress(
+  formData: FormData,
   onProgress: (pct: number) => void,
   xhrRef: React.MutableRefObject<XMLHttpRequest | null>,
-): Promise<void> {
+): Promise<{ ok: boolean; body: any }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhrRef.current = xhr;
-    xhr.open("PUT", signedUrl);
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    xhr.open("POST", "/api/files");
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 90)); // reserve 90-100% for validation
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
     };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
-      else reject(new Error(`Storage upload failed (status ${xhr.status}).`));
+      try {
+        resolve({ ok: xhr.status >= 200 && xhr.status < 300, body: JSON.parse(xhr.responseText) });
+      } catch {
+        resolve({ ok: false, body: { error: "Server returned an invalid response." } });
+      }
     };
-    xhr.onerror = () => reject(new Error("Network error while uploading to storage."));
+    xhr.onerror = () => reject(new Error("Network error during upload."));
     xhr.onabort = () => reject(new Error("__aborted__"));
-    xhr.send(file);
+    xhr.send(formData);
   });
 }
 
@@ -87,7 +76,6 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [phase, setPhase] = useState<"uploading" | "validating">("uploading");
   const [activeFile, setActiveFile] = useState<{ name: string; size: number } | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [uploader, setUploader] = useState("");
@@ -108,52 +96,20 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
       }
       setLocalError(null);
 
+      const formData = new FormData();
+      formData.append("file", file);
+      if (uploader.trim()) formData.append("uploaded_by", uploader.trim());
+
       setUploading(true);
-      setPhase("uploading");
       setProgress(0);
       setActiveFile({ name: file.name, size: file.size });
 
       try {
-        // 1. Ask our server for a signed upload URL (small JSON request — no size limit issue).
-        const urlRes = await fetch("/api/files/upload-url", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ filename: file.name, fileSize: file.size }),
-        });
-        const urlBody = (await urlRes.json()) as UploadUrlResponse;
-        if (!urlRes.ok || !urlBody.success || !urlBody.data) {
-          throw new Error(urlBody.error ?? "Could not start upload.");
+        const { ok, body } = await uploadWithProgress(formData, setProgress, xhrRef);
+        if (!ok || !body.success) {
+          throw new Error(body.error ?? "Upload failed.");
         }
-        const { signedUrl, storagePath, displayName, fileType } = urlBody.data;
-
-        // 2. Upload the file bytes DIRECTLY to Supabase Storage — bypasses our
-        //    Next.js server entirely, so Vercel's 4.5 MB request-body limit
-        //    never applies here.
-        await putToSignedUrl(signedUrl, file, setProgress, xhrRef);
-
-        // 3. Tell our server the upload is done — it inserts metadata and
-        //    triggers the validate-upload Edge Function.
-        setPhase("validating");
-        setProgress(95);
-
-        const metaRes = await fetch("/api/files", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            storage_path: storagePath,
-            filename: displayName,
-            file_size: file.size,
-            file_type: fileType,
-            uploaded_by: uploader.trim() || undefined,
-          }),
-        });
-        const metaBody = await metaRes.json();
-        if (!metaRes.ok || !metaBody.success) {
-          throw new Error(metaBody.error ?? "Upload failed during validation.");
-        }
-
-        setProgress(100);
-        onUploaded(metaBody.data as FileMetadata);
+        onUploaded(body.data as FileMetadata);
       } catch (err) {
         const message = err instanceof Error ? err.message : "An unexpected error occurred during upload.";
         if (message !== "__aborted__") {
@@ -199,6 +155,7 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
 
   return (
     <Card className="p-3 sm:p-4">
+      {/* Upload bar — short horizontal dropzone, not a tall empty square */}
       <div
         role="button"
         tabIndex={uploading ? -1 : 0}
@@ -244,9 +201,7 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
             </div>
 
             <div className="flex shrink-0 items-center gap-3">
-              <span className="text-xs text-muted-foreground">
-                {phase === "validating" ? "Validating…" : `${progress}%`}
-              </span>
+              <span className="text-xs text-muted-foreground">{progress < 100 ? `${progress}%` : "Validating…"}</span>
               <button
                 type="button"
                 onClick={(e) => {
@@ -307,6 +262,7 @@ export default function FileUploadForm({ onUploaded, onError }: Props) {
         )}
       </div>
 
+      {/* Uploader — collapsed by default so it doesn't add height to the common case */}
       <div className="mt-2">
         {showUploader ? (
           <div className="flex flex-wrap items-end gap-2">

@@ -16,11 +16,6 @@ export type ValidationResult = {
   fileType: string;
 };
 
-export type FileMeta = {
-  name: string;
-  size: number;
-};
-
 export function getFileExtension(filename: string): string {
   const ext = filename.split(".").pop() ?? "";
   return ext.toLowerCase();
@@ -45,35 +40,6 @@ export function validateFile(file: File): ValidationResult {
       ok: false,
       fileType,
       error: `File is ${(file.size / (1024 * 1024)).toFixed(1)} MB — the limit is 10 MB.`,
-    };
-  }
-  return { ok: true, fileType };
-}
-
-/**
- * Same rules as validateFile(), but for use server-side after the client
- * has already uploaded the bytes directly to Storage via a signed URL —
- * at that point we only have filename + size, not a File object.
- */
-export function validateFileMeta(meta: FileMeta): ValidationResult {
-  const fileType = getFileExtension(meta.name);
-  if (!ALLOWED_EXTENSIONS.has(fileType)) {
-    return {
-      ok: false,
-      fileType,
-      error: `File type ".${fileType}" is not allowed. Allowed: ${[
-        ...ALLOWED_EXTENSIONS,
-      ].join(", ")}.`,
-    };
-  }
-  if (meta.size <= 0) {
-    return { ok: false, fileType, error: "File is empty." };
-  }
-  if (meta.size > MAX_FILE_SIZE) {
-    return {
-      ok: false,
-      fileType,
-      error: `File is ${(meta.size / (1024 * 1024)).toFixed(1)} MB — the limit is 10 MB.`,
     };
   }
   return { ok: true, fileType };
